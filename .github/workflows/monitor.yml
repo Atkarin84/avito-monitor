@@ -1,0 +1,43 @@
+name: Avito Saratov GPU Monitor
+
+on:
+  schedule:
+    # Запуск каждые 4 часа
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+    # Позволяет запустить проверку вручную кнопкой "Run workflow" на GitHub
+
+permissions:
+  contents: write
+
+jobs:
+  check-avito:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Avito Monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          FORCE_NOTIFY: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
+        run: python monitor.py
+
+      - name: Save seen listings
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen_items.json
+          git diff --staged --quiet || (git commit -m "chore: update seen_items.json" && git push)
