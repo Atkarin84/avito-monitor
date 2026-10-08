@@ -5,12 +5,16 @@ on:
     # Запуск каждые 30 минут (проверка новых писем от Авито и пересылка в Telegram)
     - cron: '*/30 * * * *'
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 permissions:
   contents: write
 
 jobs:
   check-avito:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -32,7 +36,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          FORCE_NOTIFY: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
+          FORCE_NOTIFY: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && 'true' || 'false' }}
         run: python monitor.py
 
       - name: Save seen listings

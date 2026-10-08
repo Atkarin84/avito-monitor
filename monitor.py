@@ -68,7 +68,6 @@ def normalize_item_url(url: str, allow_any_category: bool = False) -> str | None
     if "uddg=" in url:
         qs = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
         url = qs.get("uddg", [url])[0]
-    # Handle Avito email redirect links that wrap the target URL in query params (e.g. ?u=... or &url=...)
     parsed_outer = urllib.parse.urlsplit(url)
     if parsed_outer.query:
         qs = urllib.parse.parse_qs(parsed_outer.query)
@@ -131,11 +130,11 @@ def decode_mime_words(s: str) -> str:
     return "".join(decoded)
 
 
-def fetch_from_avito_emails(email_user: str, email_pass: str, imap_host: str | None = None) -> dict[str, dict]:
+def fetch_from_avito_emails(email_user: str, email_pass: str, imap_host: str | None = None) -> tuple[dict[str, dict], str]:
     """Connect to user's mailbox via IMAP and parse Avito 'Saved Search' notification emails."""
     results: dict[str, dict] = {}
     if not email_user or not email_pass:
-        return results
+        return results, "⚠️ не настроена (секреты EMAIL_USER / EMAIL_PASSWORD не заданы)"
 
     if not imap_host:
         domain = email_user.split("@")[-1].lower().strip()
@@ -147,13 +146,12 @@ def fetch_from_avito_emails(email_user: str, email_pass: str, imap_host: str | N
         mail.login(email_user, email_pass)
         mail.select("INBOX", readonly=True)
 
-        # Search for recent emails from Avito
         status, data = mail.search(None, '(FROM "avito.ru")')
         if status != "OK" or not data or not data[0]:
             status, data = mail.search(None, "ALL")
 
         msg_ids = data[0].split()[-30:] if (data and data[0]) else []
-        print(f"[IMAP] Scanning {len(msg_ids)} recent messages...")
+        avito_emails_count = 0
 
         for num in reversed(msg_ids):
             status, msg_data = mail.fetch(num, "(RFC822)")
@@ -167,6 +165,7 @@ def fetch_from_avito_emails(email_user: str, email_pass: str, imap_host: str | N
             from_hdr = decode_mime_words(msg.get("From", "")).lower()
             if "avito" not in from_hdr:
                 continue
+            avito_emails_count += 1
 
             html_parts = []
             for part in msg.walk():
@@ -206,11 +205,10 @@ def fetch_from_avito_emails(email_user: str, email_pass: str, imap_host: str | N
                     }
 
         mail.logout()
-        print(f"[IMAP] Extracted {len(results)} matching GPU listings from Avito emails.")
+        return results, f"✅ успешно подключена ({email_user}, проверено писем Авито: {avito_emails_count})"
     except Exception as exc:
         print(f"[IMAP] Error checking email: {exc}")
-
-    return results
+        return results, f"❌ ошибка подключения к {imap_host} ({exc})"
 
 
 def fetch_via_ddg_cffi() -> dict[str, dict]:
@@ -283,11 +281,9 @@ def main() -> None:
     seen_urls = load_seen()
     all_found: dict[str, dict] = {}
 
-    # 1. Check Avito Saved Search emails via IMAP (100% immune to QRATOR IP blocks)
-    if email_user and email_pass:
-        all_found.update(fetch_from_avito_emails(email_user, email_pass, imap_host))
+    imap_items, imap_status = fetch_from_avito_emails(email_user, email_pass, imap_host)
+    all_found.update(imap_items)
 
-    # 2. Also run search fallback
     for url, item in fetch_via_ddg_cffi().items():
         if url not in all_found:
             all_found[url] = item
@@ -313,12 +309,11 @@ def main() -> None:
         save_seen(seen_urls)
         print(f"Sent Telegram notification with {len(new_items)} individual listing URLs.")
     elif force_notify:
-        imap_status = f"подключена ({email_user})" if (email_user and email_pass) else "не указана (добавь EMAIL_USER и EMAIL_PASSWORD в Secrets)"
         msg = (
-            f"ℹ️ <b>Ручная проверка завершена.</b>\n"
-            f"📧 Проверка почты Авито: <b>{imap_status}</b>\n"
+            f"ℹ️ <b>Проверка статуса мониторинга:</b>\n"
+            f"📧 Почта IMAP: <b>{imap_status}</b>\n"
             f"📦 Уже в базе отслеживания: <b>{len(seen_urls)}</b> объявлений.\n"
-            f"Новых объявлений с прошлой проверки пока нет."
+            f"⏱ Расписание: каждые 30 минут (24/7)."
         )
         send_telegram_message(token, chat_id, msg)
     else:
