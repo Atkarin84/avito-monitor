@@ -4,6 +4,7 @@ import re
 import sys
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -14,11 +15,6 @@ try:
 except ImportError:
     cffi_requests = None
 
-try:
-    from duckduckgo_search import DDGS
-except ImportError:
-    DDGS = None
-
 SEEN_FILE = Path(__file__).parent / "seen_items.json"
 
 AVITO_CATEGORY_URLS = [
@@ -28,11 +24,8 @@ AVITO_CATEGORY_URLS = [
 ]
 
 SEARCH_QUERIES = [
-    ("RX 6600 / 6600 XT", 'site:avito.ru/saratov/tovary_dlya_kompyutera RX 6600'),
-    ("RX 6600 / 6600 XT", 'site:avito.ru/saratov/tovary_dlya_kompyutera RX6600'),
-    ("RX 6600 XT", 'site:avito.ru/saratov/tovary_dlya_kompyutera "6600 XT"'),
-    ("RX 7600", 'site:avito.ru/saratov/tovary_dlya_kompyutera RX 7600'),
-    ("RX 7600", 'site:avito.ru/saratov/tovary_dlya_kompyutera RX7600'),
+    'site:avito.ru/saratov/tovary_dlya_kompyutera RX 6600',
+    'site:avito.ru/saratov/tovary_dlya_kompyutera RX 7600',
 ]
 
 ITEM_URL_RE = re.compile(
@@ -61,7 +54,6 @@ def save_seen(seen: set[str]) -> None:
 
 
 def normalize_item_url(url: str) -> str | None:
-    """Return canonical individual Avito Saratov listing URL, or None if not a valid item link."""
     url = urllib.parse.unquote(url).strip()
     if "uddg=" in url:
         qs = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
@@ -92,7 +84,6 @@ def clean_title(raw_title: str, slug: str) -> str:
     title = re.sub(r"\s*[-—|]\s*купить.*$", "", raw_title, flags=re.IGNORECASE).strip()
     title = re.sub(r"\s*купить в Саратове.*$", "", title, flags=re.IGNORECASE).strip()
     if not title or len(title) < 4:
-        # Reconstruct readable title from URL slug (remove trailing item ID)
         slug_words = re.sub(r"_\d{7,}$", "", slug).replace("_", " ").strip()
         title = slug_words.capitalize()
     return title
@@ -108,148 +99,120 @@ def extract_price(text: str) -> str | None:
     return None
 
 
+def get_free_ru_proxies() -> list[str]:
+    """Fetch free RU proxies from public GitHub lists to bypass geo-blocking on GitHub Actions."""
+    urls = [
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/RU/data.json",
+    ]
+    candidates = []
+    for u in urls:
+        try:
+            r = requests.get(u, timeout=10)
+            if r.status_code == 200:
+                for entry in r.json():
+                    p = entry.get("proxy")
+                    if p:
+                        candidates.append(p)
+        except Exception:
+            pass
+    return candidates[:25]
+
+
+def parse_avito_html(html: str, default_model: str) -> dict[str, dict]:
+    results: dict[str, dict] = {}
+    soup = BeautifulSoup(html, "html.parser")
+    for card in soup.select('[data-marker="item"]'):
+        link_el = card.select_one('a[data-marker="item-title"]')
+        if not link_el or not link_el.get("href"):
+            continue
+        href = link_el["href"]
+        if not href.startswith("http"):
+            href = "https://www.avito.ru" + href
+        clean_url = normalize_item_url(href)
+        if not clean_url:
+            continue
+
+        title_el = card.select_one('[itemprop="name"]') or link_el
+        raw_title = title_el.get_text(strip=True) if title_el else default_model
+        gpu_label = detect_gpu_label(raw_title, clean_url)
+        if not gpu_label:
+            continue
+
+        price_el = card.select_one('[itemprop="price"]')
+        price_val = price_el.get("content") if price_el and price_el.get("content") else None
+        price_str = f"{price_val} ₽" if price_val else None
+
+        slug = clean_url.rsplit("/", 1)[-1]
+        results[clean_url] = {
+            "model": gpu_label,
+            "title": clean_title(raw_title, slug),
+            "price": price_str,
+            "url": clean_url,
+        }
+    return results
+
+
 def fetch_direct_avito(proxy_url: str | None = None) -> dict[str, dict]:
-    """Attempt direct scraping of Avito Saratov category pages."""
     results: dict[str, dict] = {}
     if cffi_requests is None:
         return results
 
-    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    proxies_to_try = [proxy_url] if proxy_url else [None] + get_free_ru_proxies()
+
     for model_name, avito_url in AVITO_CATEGORY_URLS:
-        try:
-            resp = cffi_requests.get(
-                avito_url,
-                impersonate="chrome120",
-                proxies=proxies,
-                timeout=20,
-                headers={"Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8"},
-            )
-            if resp.status_code != 200 or "Доступ ограничен" in resp.text:
+        for px in proxies_to_try[:10]:
+            px_dict = {"http": px, "https": px} if px else None
+            try:
+                resp = cffi_requests.get(
+                    avito_url,
+                    impersonate="chrome120",
+                    proxies=px_dict,
+                    timeout=12,
+                    headers={"Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8"},
+                )
+                if resp.status_code == 200 and "Доступ ограничен" not in resp.text:
+                    parsed = parse_avito_html(resp.text, model_name)
+                    if parsed:
+                        results.update(parsed)
+                        break
+            except Exception:
                 continue
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for card in soup.select('[data-marker="item"]'):
-                link_el = card.select_one('a[data-marker="item-title"]')
-                if not link_el or not link_el.get("href"):
-                    continue
-                href = link_el["href"]
-                if not href.startswith("http"):
-                    href = "https://www.avito.ru" + href
-                clean_url = normalize_item_url(href)
-                if not clean_url:
-                    continue
-
-                title_el = card.select_one('[itemprop="name"]') or link_el
-                raw_title = title_el.get_text(strip=True) if title_el else model_name
-                gpu_label = detect_gpu_label(raw_title, clean_url)
-                if not gpu_label:
-                    continue
-
-                price_el = card.select_one('[itemprop="price"]')
-                price_val = price_el.get("content") if price_el and price_el.get("content") else None
-                price_str = f"{price_val} ₽" if price_val else None
-
-                slug = clean_url.rsplit("/", 1)[-1]
-                results[clean_url] = {
-                    "model": gpu_label,
-                    "title": clean_title(raw_title, slug),
-                    "price": price_str,
-                    "url": clean_url,
-                }
-        except Exception as exc:
-            print(f"[Direct] {model_name}: {exc}")
     return results
 
 
-def fetch_via_ddg_lite() -> dict[str, dict]:
-    """Fetch individual Saratov Avito item links via DuckDuckGo Lite & DDGS."""
+def fetch_via_ddg_cffi() -> dict[str, dict]:
     results: dict[str, dict] = {}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "ru-RU,ru;q=0.9",
-    }
-
-    # 1. DuckDuckGo Lite HTML parser
-    for _, query in SEARCH_QUERIES:
+    req_mod = cffi_requests if cffi_requests is not None else requests
+    for query in SEARCH_QUERIES:
         try:
-            resp = requests.post(
-                "https://lite.duckduckgo.com/lite/",
-                data={"q": query, "kl": "ru-ru"},
-                headers=headers,
-                timeout=20,
-            )
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                for a_el in soup.select("a.result-link"):
-                    href = a_el.get("href", "")
-                    clean_url = normalize_item_url(href)
-                    if not clean_url:
-                        continue
-                    raw_title = a_el.get_text(" ", strip=True)
-                    gpu_label = detect_gpu_label(raw_title, clean_url)
-                    if not gpu_label:
-                        continue
-
-                    # Try to get snippet from next table row
-                    snippet = ""
-                    tr = a_el.find_parent("tr")
-                    if tr and tr.find_next_sibling("tr"):
-                        snippet = tr.find_next_sibling("tr").get_text(" ", strip=True)
-
-                    slug = clean_url.rsplit("/", 1)[-1]
+            kwargs = {
+                "data": {"q": query},
+                "headers": {"Accept-Language": "ru-RU,ru;q=0.9"},
+                "timeout": 15,
+            }
+            if cffi_requests is not None:
+                kwargs["impersonate"] = "chrome120"
+            resp = req_mod.post("https://lite.duckduckgo.com/lite/", **kwargs)
+            text = urllib.parse.unquote(resp.text)
+            for raw_match in re.findall(
+                r"https?://(?:www\.)?avito\.ru/saratov/tovary_dlya_kompyutera/[a-zA-Z0-9_-]+_\d{7,}",
+                text,
+            ):
+                clean_url = normalize_item_url(raw_match)
+                if not clean_url or clean_url in results:
+                    continue
+                slug = clean_url.rsplit("/", 1)[-1]
+                gpu_label = detect_gpu_label("", clean_url)
+                if gpu_label:
                     results[clean_url] = {
                         "model": gpu_label,
-                        "title": clean_title(raw_title, slug),
-                        "price": extract_price(f"{raw_title} {snippet}"),
+                        "title": clean_title("", slug),
+                        "price": None,
                         "url": clean_url,
                     }
-                # Also regex-scan raw HTML for any direct item URLs
-                for raw_match in re.findall(
-                    r"https?://(?:www\.)?avito\.ru/saratov/tovary_dlya_kompyutera/[a-zA-Z0-9_-]+_\d{7,}",
-                    urllib.parse.unquote(resp.text),
-                ):
-                    clean_url = normalize_item_url(raw_match)
-                    if not clean_url or clean_url in results:
-                        continue
-                    slug = clean_url.rsplit("/", 1)[-1]
-                    gpu_label = detect_gpu_label("", clean_url)
-                    if gpu_label:
-                        results[clean_url] = {
-                            "model": gpu_label,
-                            "title": clean_title("", slug),
-                            "price": None,
-                            "url": clean_url,
-                        }
-            time.sleep(1)
+            time.sleep(2)
         except Exception as exc:
-            print(f"[DDG Lite] Error for '{query}': {exc}")
-
-    # 2. DDGS API library fallback
-    if DDGS is not None:
-        try:
-            with DDGS() as ddgs:
-                for _, query in SEARCH_QUERIES:
-                    for r in ddgs.text(query, region="ru-ru", max_results=20):
-                        href = r.get("href", "")
-                        clean_url = normalize_item_url(href)
-                        if not clean_url or clean_url in results:
-                            continue
-                        raw_title = r.get("title", "")
-                        body = r.get("body", "")
-                        gpu_label = detect_gpu_label(f"{raw_title} {body}", clean_url)
-                        if not gpu_label:
-                            continue
-                        slug = clean_url.rsplit("/", 1)[-1]
-                        results[clean_url] = {
-                            "model": gpu_label,
-                            "title": clean_title(raw_title, slug),
-                            "price": extract_price(f"{raw_title} {body}"),
-                            "url": clean_url,
-                        }
-                    time.sleep(1)
-        except Exception as exc:
-            print(f"[DDGS] Error: {exc}")
-
+            print(f"[DDG] {exc}")
     return results
 
 
@@ -272,6 +235,7 @@ def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     proxy_url = os.environ.get("PROXY_URL", "").strip() or None
+    force_notify = os.environ.get("FORCE_NOTIFY", "false").lower() == "true"
 
     if not token or not chat_id:
         print("ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables are required.")
@@ -280,11 +244,8 @@ def main() -> None:
     seen_urls = load_seen()
     all_found: dict[str, dict] = {}
 
-    direct_items = fetch_direct_avito(proxy_url=proxy_url)
-    all_found.update(direct_items)
-
-    fallback_items = fetch_via_ddg_lite()
-    for url, item in fallback_items.items():
+    all_found.update(fetch_direct_avito(proxy_url=proxy_url))
+    for url, item in fetch_via_ddg_cffi().items():
         if url not in all_found:
             all_found[url] = item
 
@@ -308,8 +269,17 @@ def main() -> None:
         send_telegram_message(token, chat_id, "\n".join(lines))
         save_seen(seen_urls)
         print(f"Sent Telegram notification with {len(new_items)} individual listing URLs.")
+    elif force_notify:
+        # Only on manual "Run workflow" button click, confirm that check completed and list tracked count
+        msg = (
+            f"ℹ️ <b>Ручная проверка завершена.</b>\n"
+            f"Новых объявлений с момента прошлой проверки пока не появилось "
+            f"(уже в базе отслеживания: <b>{len(seen_urls)}</b> объявлений).\n"
+            f"Как только выйдет новое — пришлю прямую ссылку!"
+        )
+        send_telegram_message(token, chat_id, msg)
     else:
-        print("No new listings since last check. Nothing sent to Telegram.")
+        print("No new listings since last check. Silent mode.")
 
 
 if __name__ == "__main__":
