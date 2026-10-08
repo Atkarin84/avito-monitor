@@ -2,10 +2,9 @@ name: Avito Saratov GPU Monitor
 
 on:
   schedule:
-    # Запуск каждые 4 часа
-    - cron: '0 */4 * * *'
+    # Запуск каждые 30 минут (проверка новых писем от Авито и пересылка в Telegram)
+    - cron: '*/30 * * * *'
   workflow_dispatch:
-    # Позволяет запустить проверку вручную кнопкой "Run workflow" на GitHub
 
 permissions:
   contents: write
@@ -31,7 +30,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          PROXY_URL: ${{ secrets.PROXY_URL }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           FORCE_NOTIFY: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
         run: python monitor.py
 

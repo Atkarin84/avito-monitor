@@ -1,10 +1,12 @@
+import email
+from email.header import decode_header
+import imaplib
 import json
 import os
 import re
 import sys
 import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -17,19 +19,27 @@ except ImportError:
 
 SEEN_FILE = Path(__file__).parent / "seen_items.json"
 
-AVITO_CATEGORY_URLS = [
-    ("RX 6600", "https://www.avito.ru/saratov/tovary_dlya_kompyutera/komplektuyuschie/videokarty-ASgBAgICAkTGB~pm7gmmZw?q=RX+6600&s=104"),
-    ("RX 6600 XT", "https://www.avito.ru/saratov/tovary_dlya_kompyutera/komplektuyuschie/videokarty-ASgBAgICAkTGB~pm7gmmZw?q=RX+6600+XT&s=104"),
-    ("RX 7600", "https://www.avito.ru/saratov/tovary_dlya_kompyutera/komplektuyuschie/videokarty-ASgBAgICAkTGB~pm7gmmZw?q=RX+7600&s=104"),
-]
-
-SEARCH_QUERIES = [
-    'site:avito.ru/saratov/tovary_dlya_kompyutera RX 6600',
-    'site:avito.ru/saratov/tovary_dlya_kompyutera RX 7600',
-]
+IMAP_SERVERS = {
+    "yandex.ru": "imap.yandex.ru",
+    "ya.ru": "imap.yandex.ru",
+    "yandex.com": "imap.yandex.ru",
+    "mail.ru": "imap.mail.ru",
+    "inbox.ru": "imap.mail.ru",
+    "list.ru": "imap.mail.ru",
+    "bk.ru": "imap.mail.ru",
+    "internet.ru": "imap.mail.ru",
+    "gmail.com": "imap.gmail.com",
+    "googlemail.com": "imap.gmail.com",
+    "rambler.ru": "imap.rambler.ru",
+}
 
 ITEM_URL_RE = re.compile(
     r"^https?://(?:www\.|m\.)?avito\.ru/saratov/tovary_dlya_kompyutera/([a-z0-9_-]+_\d{7,})$",
+    re.IGNORECASE,
+)
+
+ANY_AVITO_ITEM_RE = re.compile(
+    r"^https?://(?:www\.|m\.)?avito\.ru/[^/]+/[^/]+/([a-z0-9_-]+_\d{7,})$",
     re.IGNORECASE,
 )
 
@@ -53,14 +63,25 @@ def save_seen(seen: set[str]) -> None:
     )
 
 
-def normalize_item_url(url: str) -> str | None:
+def normalize_item_url(url: str, allow_any_category: bool = False) -> str | None:
     url = urllib.parse.unquote(url).strip()
     if "uddg=" in url:
         qs = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
         url = qs.get("uddg", [url])[0]
+    # Handle Avito email redirect links that wrap the target URL in query params (e.g. ?u=... or &url=...)
+    parsed_outer = urllib.parse.urlsplit(url)
+    if parsed_outer.query:
+        qs = urllib.parse.parse_qs(parsed_outer.query)
+        for key in ("u", "url", "to", "target", "redirect"):
+            if key in qs and "avito.ru" in qs[key][0]:
+                url = urllib.parse.unquote(qs[key][0])
+                break
+
     parsed = urllib.parse.urlsplit(url)
     clean = f"https://www.avito.ru{parsed.path.rstrip('/')}"
     if ITEM_URL_RE.match(clean):
+        return clean
+    if allow_any_category and ANY_AVITO_ITEM_RE.match(clean):
         return clean
     return None
 
@@ -90,100 +111,116 @@ def clean_title(raw_title: str, slug: str) -> str:
 
 
 def extract_price(text: str) -> str | None:
-    m = re.search(r"(?:цена|за|—|-|:)\s*(\d[\d\s\u00a0]{2,8})\s*(?:₽|руб|р\.)", text, re.IGNORECASE)
-    if not m:
-        m = re.search(r"(\d{1,3}(?:[\s\u00a0]\d{3})+)\s*(?:₽|руб|р\.)", text, re.IGNORECASE)
+    m = re.search(r"(\d{1,3}(?:[\s\u00a0]\d{3})+|\d{4,7})\s*(?:₽|руб|р\.)", text, re.IGNORECASE)
     if m:
         val = re.sub(r"\s+", " ", m.group(1).strip())
         return f"{val} ₽"
     return None
 
 
-def get_free_ru_proxies() -> list[str]:
-    """Fetch free RU proxies from public GitHub lists to bypass geo-blocking on GitHub Actions."""
-    urls = [
-        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/RU/data.json",
-    ]
-    candidates = []
-    for u in urls:
-        try:
-            r = requests.get(u, timeout=10)
-            if r.status_code == 200:
-                for entry in r.json():
-                    p = entry.get("proxy")
-                    if p:
-                        candidates.append(p)
-        except Exception:
-            pass
-    return candidates[:25]
+def decode_mime_words(s: str) -> str:
+    if not s:
+        return ""
+    parts = decode_header(s)
+    decoded = []
+    for content, enc in parts:
+        if isinstance(content, bytes):
+            decoded.append(content.decode(enc or "utf-8", errors="replace"))
+        else:
+            decoded.append(content)
+    return "".join(decoded)
 
 
-def parse_avito_html(html: str, default_model: str) -> dict[str, dict]:
+def fetch_from_avito_emails(email_user: str, email_pass: str, imap_host: str | None = None) -> dict[str, dict]:
+    """Connect to user's mailbox via IMAP and parse Avito 'Saved Search' notification emails."""
     results: dict[str, dict] = {}
-    soup = BeautifulSoup(html, "html.parser")
-    for card in soup.select('[data-marker="item"]'):
-        link_el = card.select_one('a[data-marker="item-title"]')
-        if not link_el or not link_el.get("href"):
-            continue
-        href = link_el["href"]
-        if not href.startswith("http"):
-            href = "https://www.avito.ru" + href
-        clean_url = normalize_item_url(href)
-        if not clean_url:
-            continue
-
-        title_el = card.select_one('[itemprop="name"]') or link_el
-        raw_title = title_el.get_text(strip=True) if title_el else default_model
-        gpu_label = detect_gpu_label(raw_title, clean_url)
-        if not gpu_label:
-            continue
-
-        price_el = card.select_one('[itemprop="price"]')
-        price_val = price_el.get("content") if price_el and price_el.get("content") else None
-        price_str = f"{price_val} ₽" if price_val else None
-
-        slug = clean_url.rsplit("/", 1)[-1]
-        results[clean_url] = {
-            "model": gpu_label,
-            "title": clean_title(raw_title, slug),
-            "price": price_str,
-            "url": clean_url,
-        }
-    return results
-
-
-def fetch_direct_avito(proxy_url: str | None = None) -> dict[str, dict]:
-    results: dict[str, dict] = {}
-    if cffi_requests is None:
+    if not email_user or not email_pass:
         return results
 
-    proxies_to_try = [proxy_url] if proxy_url else [None] + get_free_ru_proxies()
+    if not imap_host:
+        domain = email_user.split("@")[-1].lower().strip()
+        imap_host = IMAP_SERVERS.get(domain, f"imap.{domain}")
 
-    for model_name, avito_url in AVITO_CATEGORY_URLS:
-        for px in proxies_to_try[:10]:
-            px_dict = {"http": px, "https": px} if px else None
-            try:
-                resp = cffi_requests.get(
-                    avito_url,
-                    impersonate="chrome120",
-                    proxies=px_dict,
-                    timeout=12,
-                    headers={"Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8"},
-                )
-                if resp.status_code == 200 and "Доступ ограничен" not in resp.text:
-                    parsed = parse_avito_html(resp.text, model_name)
-                    if parsed:
-                        results.update(parsed)
-                        break
-            except Exception:
+    print(f"[IMAP] Connecting to {imap_host} as {email_user}...")
+    try:
+        mail = imaplib.IMAP4_SSL(imap_host, 993)
+        mail.login(email_user, email_pass)
+        mail.select("INBOX", readonly=True)
+
+        # Search for recent emails from Avito
+        status, data = mail.search(None, '(FROM "avito.ru")')
+        if status != "OK" or not data or not data[0]:
+            status, data = mail.search(None, "ALL")
+
+        msg_ids = data[0].split()[-30:] if (data and data[0]) else []
+        print(f"[IMAP] Scanning {len(msg_ids)} recent messages...")
+
+        for num in reversed(msg_ids):
+            status, msg_data = mail.fetch(num, "(RFC822)")
+            if status != "OK" or not msg_data:
                 continue
+            raw_email = msg_data[0][1]
+            if not isinstance(raw_email, bytes):
+                continue
+
+            msg = email.message_from_bytes(raw_email)
+            from_hdr = decode_mime_words(msg.get("From", "")).lower()
+            if "avito" not in from_hdr:
+                continue
+
+            html_parts = []
+            for part in msg.walk():
+                ctype = part.get_content_type()
+                if ctype in ("text/html", "text/plain"):
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or "utf-8"
+                        html_parts.append(payload.decode(charset, errors="replace"))
+
+            full_body = "\n".join(html_parts)
+            soup = BeautifulSoup(full_body, "html.parser")
+
+            for a_el in soup.find_all("a", href=True):
+                href = a_el["href"]
+                clean_url = normalize_item_url(href, allow_any_category=True)
+                if not clean_url:
+                    continue
+
+                link_text = a_el.get_text(" ", strip=True)
+                parent_text = a_el.parent.get_text(" ", strip=True) if a_el.parent else link_text
+                gpu_label = detect_gpu_label(f"{link_text} {parent_text}", clean_url)
+                if not gpu_label:
+                    continue
+
+                slug = clean_url.rsplit("/", 1)[-1]
+                existing = results.get(clean_url)
+                title = clean_title(link_text, slug)
+                price = extract_price(parent_text)
+
+                if not existing or (len(title) > len(existing["title"])):
+                    results[clean_url] = {
+                        "model": gpu_label,
+                        "title": title,
+                        "price": price or (existing.get("price") if existing else None),
+                        "url": clean_url,
+                    }
+
+        mail.logout()
+        print(f"[IMAP] Extracted {len(results)} matching GPU listings from Avito emails.")
+    except Exception as exc:
+        print(f"[IMAP] Error checking email: {exc}")
+
     return results
 
 
 def fetch_via_ddg_cffi() -> dict[str, dict]:
     results: dict[str, dict] = {}
     req_mod = cffi_requests if cffi_requests is not None else requests
-    for query in SEARCH_QUERIES:
+    queries = [
+        'site:avito.ru/saratov/tovary_dlya_kompyutera RX 6600',
+        'site:avito.ru/saratov/tovary_dlya_kompyutera RX 7600',
+    ]
+    for query in queries:
         try:
             kwargs = {
                 "data": {"q": query},
@@ -234,7 +271,9 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> None:
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-    proxy_url = os.environ.get("PROXY_URL", "").strip() or None
+    email_user = os.environ.get("EMAIL_USER", "").strip()
+    email_pass = os.environ.get("EMAIL_PASSWORD", "").strip()
+    imap_host = os.environ.get("IMAP_HOST", "").strip() or None
     force_notify = os.environ.get("FORCE_NOTIFY", "false").lower() == "true"
 
     if not token or not chat_id:
@@ -244,7 +283,11 @@ def main() -> None:
     seen_urls = load_seen()
     all_found: dict[str, dict] = {}
 
-    all_found.update(fetch_direct_avito(proxy_url=proxy_url))
+    # 1. Check Avito Saved Search emails via IMAP (100% immune to QRATOR IP blocks)
+    if email_user and email_pass:
+        all_found.update(fetch_from_avito_emails(email_user, email_pass, imap_host))
+
+    # 2. Also run search fallback
     for url, item in fetch_via_ddg_cffi().items():
         if url not in all_found:
             all_found[url] = item
@@ -270,12 +313,12 @@ def main() -> None:
         save_seen(seen_urls)
         print(f"Sent Telegram notification with {len(new_items)} individual listing URLs.")
     elif force_notify:
-        # Only on manual "Run workflow" button click, confirm that check completed and list tracked count
+        imap_status = f"подключена ({email_user})" if (email_user and email_pass) else "не указана (добавь EMAIL_USER и EMAIL_PASSWORD в Secrets)"
         msg = (
             f"ℹ️ <b>Ручная проверка завершена.</b>\n"
-            f"Новых объявлений с момента прошлой проверки пока не появилось "
-            f"(уже в базе отслеживания: <b>{len(seen_urls)}</b> объявлений).\n"
-            f"Как только выйдет новое — пришлю прямую ссылку!"
+            f"📧 Проверка почты Авито: <b>{imap_status}</b>\n"
+            f"📦 Уже в базе отслеживания: <b>{len(seen_urls)}</b> объявлений.\n"
+            f"Новых объявлений с прошлой проверки пока нет."
         )
         send_telegram_message(token, chat_id, msg)
     else:
